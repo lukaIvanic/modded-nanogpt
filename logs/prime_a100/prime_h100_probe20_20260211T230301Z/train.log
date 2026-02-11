@@ -1,0 +1,48 @@
+logs/prime_h100_probe20_20260211T230301Z.txt
+Compiling model and warming up kernels (~7 minutes on first execution)
+Sampling steps [0, 1, 2, 6, 7, 8, 13, 14, 15] for warmup
+Exception in thread Thread-2 (_load):
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/threading.py", line 1016, in _bootstrap_inner
+    self.run()
+  File "/usr/lib/python3.10/threading.py", line 953, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/ubuntu/projects/nanogpt-speedrun/modded-nanogpt/train_gpt.py", line 1558, in _load
+    tokens = _load_data_shard(next(self.file_iter))
+StopIteration
+Resetting Model
+step:0/20 val_loss:10.8305 train_time:0ms step_avg:0.03ms
+Exception in thread Thread-4 (_load):
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/threading.py", line 1016, in _bootstrap_inner
+    self.run()
+  File "/usr/lib/python3.10/threading.py", line 953, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/ubuntu/projects/nanogpt-speedrun/modded-nanogpt/train_gpt.py", line 1558, in _load
+    tokens = _load_data_shard(next(self.file_iter))
+StopIteration
+step:1/20 train_time:782ms step_avg:781.83ms
+step:2/20 train_time:1460ms step_avg:729.95ms
+step:3/20 train_time:2199ms step_avg:733.02ms
+step:4/20 train_time:2915ms step_avg:728.83ms
+step:5/20 train_time:3676ms step_avg:735.25ms
+step:5/20 val_loss:8.5339 train_time:3679ms step_avg:735.79ms
+step:6/20 train_time:4367ms step_avg:727.79ms
+step:7/20 train_time:5103ms step_avg:729.02ms
+step:8/20 train_time:5821ms step_avg:727.61ms
+step:9/20 train_time:6531ms step_avg:725.67ms
+step:10/20 train_time:7275ms step_avg:727.46ms
+step:10/20 val_loss:8.1097 train_time:7306ms step_avg:730.55ms
+step:11/20 train_time:8030ms step_avg:729.98ms
+step:12/20 train_time:8735ms step_avg:727.91ms
+step:13/20 train_time:9463ms step_avg:727.93ms
+step:14/20 train_time:10207ms step_avg:729.07ms
+step:15/20 train_time:10976ms step_avg:731.75ms
+step:15/20 val_loss:7.5409 train_time:10984ms step_avg:732.28ms
+step:16/20 train_time:11647ms step_avg:727.94ms
+step:17/20 train_time:12333ms step_avg:725.48ms
+step:18/20 train_time:13035ms step_avg:724.18ms
+step:19/20 train_time:13764ms step_avg:724.43ms
+step:20/20 train_time:14464ms step_avg:723.20ms
+step:20/20 val_loss:7.2898 train_time:14500ms step_avg:725.02ms
+peak memory allocated: 12831 MiB reserved: 13240 MiB

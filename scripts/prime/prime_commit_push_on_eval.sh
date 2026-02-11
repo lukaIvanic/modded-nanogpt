@@ -10,7 +10,7 @@ RUN_ID="$1"
 
 LOCAL_REPO="${LOCAL_REPO:-/Users/lukaivanic/projects/nanogpt-speedrun/modded-nanogpt}"
 LOCAL_RUN_DIR="${LOCAL_RUN_DIR:-$LOCAL_REPO/logs/prime_a100/$RUN_ID}"
-TARGET_BRANCH="${TARGET_BRANCH:-codex/prime-a100-spot}"
+TARGET_BRANCH="${TARGET_BRANCH:-codex/prime-h100-spot}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 
 LAST_STEP_FILE="$LOCAL_RUN_DIR/.last_pushed_step"
