@@ -1,0 +1,26 @@
+logs/prime_h100_kd_ramp20_20260211T231454Z.txt
+Compiling model and warming up kernels (~7 minutes on first execution)
+Sampling steps [0, 1, 2, 6, 7, 8, 13, 14, 15] for warmup
+Resetting Model
+step:1/20 train_time:2579ms step_avg:2578.72ms
+step:2/20 train_time:4987ms step_avg:2493.54ms
+step:3/20 train_time:7521ms step_avg:2506.99ms
+step:4/20 train_time:9982ms step_avg:2495.43ms
+step:5/20 train_time:12386ms step_avg:2477.25ms
+step:6/20 train_time:14713ms step_avg:2452.21ms
+step:7/20 train_time:17172ms step_avg:2453.14ms
+step:8/20 train_time:22707ms step_avg:2838.42ms
+step:9/20 train_time:28200ms step_avg:3133.37ms
+step:10/20 train_time:33480ms step_avg:3348.00ms
+step:11/20 train_time:38855ms step_avg:3532.29ms
+step:12/20 train_time:44248ms step_avg:3687.32ms
+step:13/20 train_time:49411ms step_avg:3800.83ms
+step:14/20 train_time:54799ms step_avg:3914.19ms
+step:15/20 train_time:64496ms step_avg:4299.73ms
+step:16/20 train_time:73665ms step_avg:4604.08ms
+step:17/20 train_time:83419ms step_avg:4907.00ms
+step:18/20 train_time:92732ms step_avg:5151.78ms
+step:19/20 train_time:102146ms step_avg:5376.09ms
+step:20/20 train_time:111487ms step_avg:5574.37ms
+step:20/20 val_loss:6.3780 train_time:111522ms step_avg:5576.11ms
+peak memory allocated: 42843 MiB reserved: 56026 MiB
