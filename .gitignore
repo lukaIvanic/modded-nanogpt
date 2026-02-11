@@ -1,5 +1,11 @@
 fineweb10B/
 pylog124M/
 __pycache__/
-logs/
+logs/*
+!logs/prime_a100/
+!logs/prime_a100/**
+logs/**/state_step*.pt
+logs/**/*.pt
+logs/**/*.bin
+logs/**/*.partial
 .DS_Store
