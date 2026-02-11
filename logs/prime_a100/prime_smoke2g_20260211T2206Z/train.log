@@ -1,0 +1,51 @@
+W0211 21:59:57.750000 13392 torch/distributed/run.py:793] 
+W0211 21:59:57.750000 13392 torch/distributed/run.py:793] *****************************************
+W0211 21:59:57.750000 13392 torch/distributed/run.py:793] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0211 21:59:57.750000 13392 torch/distributed/run.py:793] *****************************************
+/root/projects/nanogpt-speedrun/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py:716: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+/root/projects/nanogpt-speedrun/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py:716: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+Traceback (most recent call last):
+  File "/root/projects/nanogpt-speedrun/modded-nanogpt/train_gpt.py", line 36, in <module>
+    from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+  File "/root/projects/nanogpt-speedrun/modded-nanogpt/triton_kernels.py", line 4, in <module>
+    from triton.tools.tensor_descriptor import TensorDescriptor
+ModuleNotFoundError: No module named 'triton.tools.tensor_descriptor'
+Traceback (most recent call last):
+  File "/root/projects/nanogpt-speedrun/modded-nanogpt/train_gpt.py", line 36, in <module>
+    from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+  File "/root/projects/nanogpt-speedrun/modded-nanogpt/triton_kernels.py", line 4, in <module>
+    from triton.tools.tensor_descriptor import TensorDescriptor
+ModuleNotFoundError: No module named 'triton.tools.tensor_descriptor'
+W0211 22:00:00.648000 13392 torch/distributed/elastic/multiprocessing/api.py:897] Sending process 13441 closing signal SIGTERM
+E0211 22:00:00.712000 13392 torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 0 (pid: 13440) of binary: /root/projects/nanogpt-speedrun/.venv/bin/python
+Traceback (most recent call last):
+  File "/root/projects/nanogpt-speedrun/.venv/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+  File "/root/projects/nanogpt-speedrun/.venv/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 355, in wrapper
+    return f(*args, **kwargs)
+  File "/root/projects/nanogpt-speedrun/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 919, in main
+    run(args)
+  File "/root/projects/nanogpt-speedrun/.venv/lib/python3.10/site-packages/torch/distributed/run.py", line 910, in run
+    elastic_launch(
+  File "/root/projects/nanogpt-speedrun/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/root/projects/nanogpt-speedrun/.venv/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train_gpt.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-02-11_22:00:00
+  host      : cocky-tacky-bobcat.datacrunch.io
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 13440)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
