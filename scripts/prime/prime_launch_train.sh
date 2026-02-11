@@ -1,21 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SSH_USER="${SSH_USER:-root}"
-SSH_HOST="${SSH_HOST:-135.181.63.140}"
+SSH_USER="${SSH_USER:-ubuntu}"
+SSH_HOST="${SSH_HOST:-216.81.248.26}"
 SSH_PORT="${SSH_PORT:-22}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/prime_intellect_codex_ed25519}"
 
-REMOTE_BASE="${REMOTE_BASE:-/root/projects/nanogpt-speedrun}"
+if [[ -z "${REMOTE_BASE:-}" ]]; then
+  if [[ "$SSH_USER" == "root" ]]; then
+    REMOTE_BASE="/root/projects/nanogpt-speedrun"
+  else
+    REMOTE_BASE="/home/$SSH_USER/projects/nanogpt-speedrun"
+  fi
+fi
 REMOTE_REPO="${REMOTE_REPO:-$REMOTE_BASE/modded-nanogpt}"
 REMOTE_RUNS="${REMOTE_RUNS:-$REMOTE_BASE/runs}"
 REMOTE_VENV="${REMOTE_VENV:-$REMOTE_BASE/.venv}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-5}"
 VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-1}"
 SAVE_CHECKPOINT="${SAVE_CHECKPOINT:-0}"
 DISABLE_COMPILE="${DISABLE_COMPILE:-1}"
+TRAIN_BS_SCHEDULE="${TRAIN_BS_SCHEDULE:-}"
+TRAIN_BS_EXTENSION="${TRAIN_BS_EXTENSION:-}"
+TRAIN_MAX_SEQ_LEN="${TRAIN_MAX_SEQ_LEN:-}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-}"
+VAL_TOKENS="${VAL_TOKENS:-}"
 
 RUN_ID="${RUN_ID:-prime_smoke_$(date -u +%Y%m%dT%H%M%SZ)}"
 REMOTE_RUN_DIR="$REMOTE_RUNS/$RUN_ID"
@@ -53,6 +64,11 @@ export VAL_LOSS_EVERY='${VAL_LOSS_EVERY}'
 export SAVE_CHECKPOINT='${SAVE_CHECKPOINT}'
 export DISABLE_COMPILE='${DISABLE_COMPILE}'
 export CKPT_DIR="\$RUN_DIR/checkpoints"
+if [[ -n '${TRAIN_BS_SCHEDULE}' ]]; then export TRAIN_BS_SCHEDULE='${TRAIN_BS_SCHEDULE}'; fi
+if [[ -n '${TRAIN_BS_EXTENSION}' ]]; then export TRAIN_BS_EXTENSION='${TRAIN_BS_EXTENSION}'; fi
+if [[ -n '${TRAIN_MAX_SEQ_LEN}' ]]; then export TRAIN_MAX_SEQ_LEN='${TRAIN_MAX_SEQ_LEN}'; fi
+if [[ -n '${VAL_BATCH_SIZE}' ]]; then export VAL_BATCH_SIZE='${VAL_BATCH_SIZE}'; fi
+if [[ -n '${VAL_TOKENS}' ]]; then export VAL_TOKENS='${VAL_TOKENS}'; fi
 
 cd "\$REPO"
 mkdir -p "\$RUN_DIR"
@@ -76,12 +92,12 @@ print('cuda_device_count=' + str(torch.cuda.device_count()))
 for i in range(torch.cuda.device_count()):
     print(f'gpu[{i}]=' + torch.cuda.get_device_name(i))
 PY
-  nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
+  nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader || true
 } > "\$RUN_DIR/env.txt"
 
 nvidia-smi --query-gpu=timestamp,index,name,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free \
   --format=csv -l 2 > "\$RUN_DIR/gpu.csv" &
-SMI_PID=$!
+SMI_PID=\$!
 cleanup() {
   kill "\$SMI_PID" >/dev/null 2>&1 || true
 }

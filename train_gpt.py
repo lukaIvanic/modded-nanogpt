@@ -58,6 +58,16 @@ def env_float(name: str, default: float) -> float:
     return float(value)
 
 
+def env_int_tuple(name: str, default: tuple) -> tuple:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if not parts:
+        return default
+    return tuple(int(p) for p in parts)
+
+
 DISABLE_COMPILE = env_flag("DISABLE_COMPILE", False)
 
 
@@ -784,12 +794,14 @@ class NorMuonAndAdam:
         grad = grad.float()
         wd_factor = wd_tensor.to(torch.float32)
         lr_factor = lr_tensor.to(torch.float32)
-        p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        # Use int32 bit-ops for broader CUDA kernel support (uint32 shifts are not
+        # implemented on some nightly stacks).
+        p_precise_raw = (p.to(torch.int32) << 16) | mantissa.to(torch.int32)
         p_precise = p_precise_raw.view(torch.float32)
         mask = (grad * p_precise) >= 0
         p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
-        p.copy_((p_precise_raw >> 16).to(torch.uint16))
-        mantissa.copy_(p_precise_raw.to(torch.uint16))
+        p.copy_(((p_precise_raw >> 16) & 0xFFFF).to(torch.uint16))
+        mantissa.copy_((p_precise_raw & 0xFFFF).to(torch.uint16))
 
     @staticmethod
     @torch_compile(dynamic=False, fullgraph=True)
@@ -1950,6 +1962,13 @@ else:
     args.num_scheduled_iterations = env_int("NUM_SCHEDULED_ITERATIONS", args.num_scheduled_iterations)
     args.num_extension_iterations = env_int("NUM_EXTENSION_ITERATIONS", args.num_extension_iterations)
     args.num_iterations = args.num_scheduled_iterations + args.num_extension_iterations
+
+# Optional memory/runtime overrides (useful for single-GPU smoke tests).
+args.val_tokens = env_int("VAL_TOKENS", args.val_tokens)
+args.train_max_seq_len = env_int("TRAIN_MAX_SEQ_LEN", args.train_max_seq_len)
+args.val_batch_size = env_int("VAL_BATCH_SIZE", args.val_batch_size)
+args.train_bs_extension = env_int("TRAIN_BS_EXTENSION", args.train_bs_extension)
+args.train_bs_schedule = env_int_tuple("TRAIN_BS_SCHEDULE", args.train_bs_schedule)
 
 
 @dataclass

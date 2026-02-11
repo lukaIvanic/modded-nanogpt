@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SSH_USER="${SSH_USER:-root}"
-SSH_HOST="${SSH_HOST:-135.181.63.140}"
+SSH_USER="${SSH_USER:-ubuntu}"
+SSH_HOST="${SSH_HOST:-216.81.248.26}"
 SSH_PORT="${SSH_PORT:-22}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/prime_intellect_codex_ed25519}"
 
@@ -10,7 +10,13 @@ LOCAL_REPO="${LOCAL_REPO:-/Users/lukaivanic/projects/nanogpt-speedrun/modded-nan
 LOCAL_TRAIN_SHARD="${LOCAL_TRAIN_SHARD:-$LOCAL_REPO/data/fineweb10B/fineweb_train_000001.bin}"
 LOCAL_VAL_SHARD="${LOCAL_VAL_SHARD:-$LOCAL_REPO/data/fineweb10B/fineweb_val_000000.bin}"
 
-REMOTE_BASE="${REMOTE_BASE:-/root/projects/nanogpt-speedrun}"
+if [[ -z "${REMOTE_BASE:-}" ]]; then
+  if [[ "$SSH_USER" == "root" ]]; then
+    REMOTE_BASE="/root/projects/nanogpt-speedrun"
+  else
+    REMOTE_BASE="/home/$SSH_USER/projects/nanogpt-speedrun"
+  fi
+fi
 REMOTE_REPO="${REMOTE_REPO:-$REMOTE_BASE/modded-nanogpt}"
 REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-$REMOTE_REPO/data/fineweb10B}"
 REMOTE_VENV="${REMOTE_VENV:-$REMOTE_BASE/.venv}"
@@ -57,13 +63,13 @@ rsync -az \
   "$SSH_USER@$SSH_HOST:$REMOTE_DATA_DIR/"
 
 echo "[INFO] Validating remote shard headers (magic/version/token_count)..."
-ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "'$REMOTE_VENV/bin/python' - <<'PY'
+ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "REMOTE_DATA_DIR='$REMOTE_DATA_DIR' '$REMOTE_VENV/bin/python' - <<'PY'
 import os
 import struct
 
 paths = [
-    '/root/projects/nanogpt-speedrun/modded-nanogpt/data/fineweb10B/fineweb_train_000001.bin',
-    '/root/projects/nanogpt-speedrun/modded-nanogpt/data/fineweb10B/fineweb_val_000000.bin',
+    os.path.join(os.environ['REMOTE_DATA_DIR'], 'fineweb_train_000001.bin'),
+    os.path.join(os.environ['REMOTE_DATA_DIR'], 'fineweb_val_000000.bin'),
 ]
 for path in paths:
     with open(path, 'rb') as f:

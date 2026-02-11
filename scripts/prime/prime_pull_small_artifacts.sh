@@ -9,12 +9,18 @@ fi
 RUN_ID="$1"
 WATCH_MODE="${2:-}"
 
-SSH_USER="${SSH_USER:-root}"
-SSH_HOST="${SSH_HOST:-135.181.63.140}"
+SSH_USER="${SSH_USER:-ubuntu}"
+SSH_HOST="${SSH_HOST:-216.81.248.26}"
 SSH_PORT="${SSH_PORT:-22}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/prime_intellect_codex_ed25519}"
 
-REMOTE_BASE="${REMOTE_BASE:-/root/projects/nanogpt-speedrun}"
+if [[ -z "${REMOTE_BASE:-}" ]]; then
+  if [[ "$SSH_USER" == "root" ]]; then
+    REMOTE_BASE="/root/projects/nanogpt-speedrun"
+  else
+    REMOTE_BASE="/home/$SSH_USER/projects/nanogpt-speedrun"
+  fi
+fi
 REMOTE_RUNS="${REMOTE_RUNS:-$REMOTE_BASE/runs}"
 REMOTE_RUN_DIR="$REMOTE_RUNS/$RUN_ID"
 
