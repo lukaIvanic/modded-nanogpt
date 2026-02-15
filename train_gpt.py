@@ -57,6 +57,12 @@ def env_float(name: str, default: float) -> float:
         return default
     return float(value)
 
+def env_optional_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return None
+    return float(value)
+
 
 def env_int_tuple(name: str, default: tuple) -> tuple:
     value = os.environ.get(name)
@@ -69,6 +75,7 @@ def env_int_tuple(name: str, default: tuple) -> tuple:
 
 
 DISABLE_COMPILE = env_flag("DISABLE_COMPILE", False)
+SKIP_WARMUP = env_flag("SKIP_WARMUP", False)
 
 
 def torch_compile(fn=None, **kwargs):
@@ -967,12 +974,37 @@ class AttnArgs:
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
 
+FLASH_ATTN_BACKEND = "none"
 try:
     from flash_attn import flash_attn_interface
     HAS_FLASH_ATTN = True
+    FLASH_ATTN_BACKEND = "flash_attn"
 except Exception:
     flash_attn_interface = None
     HAS_FLASH_ATTN = False
+    # Docker images may not have the flash_attn package, but can still access FA3 via kernels.
+    try:
+        import sys as _sys
+        import os as _os
+        from kernels import get_kernel
+        fa3_mod = get_kernel("varunneal/flash-attention-3")
+        fa3_dir = _os.path.dirname(getattr(fa3_mod, "__file__", "")) if getattr(fa3_mod, "__file__", None) else ""
+        if fa3_dir and fa3_dir not in _sys.path:
+            _sys.path.insert(0, fa3_dir)
+        flash_attn_interface = getattr(fa3_mod, "flash_attn_interface", fa3_mod)
+        HAS_FLASH_ATTN = hasattr(flash_attn_interface, "flash_attn_varlen_func")
+        if HAS_FLASH_ATTN:
+            FLASH_ATTN_BACKEND = "fa3_kernels"
+    except Exception:
+        flash_attn_interface = None
+        HAS_FLASH_ATTN = False
+
+if env_flag("FORCE_DISABLE_FLASH_ATTN", False):
+    HAS_FLASH_ATTN = False
+    FLASH_ATTN_BACKEND = f"{FLASH_ATTN_BACKEND}_forced_off"
+REQUIRE_FLASH_ATTN = env_flag("REQUIRE_FLASH_ATTN", False)
+if REQUIRE_FLASH_ATTN and not HAS_FLASH_ATTN:
+    raise RuntimeError("REQUIRE_FLASH_ATTN=1 but no flash attention backend is available.")
 
 def _sdpa_varlen_func(
     q: Tensor,
@@ -993,8 +1025,6 @@ def _sdpa_varlen_func(
     for i in range(num_sequences):
         start = int(cu_seqlens_q[i].item())
         end = int(cu_seqlens_q[i + 1].item())
-        if end <= start:
-            continue
         q_i = q[start:end].transpose(0, 1).unsqueeze(0)  # [1, H, L, D]
         k_i = k[start:end].transpose(0, 1).unsqueeze(0)
         v_i = v[start:end].transpose(0, 1).unsqueeze(0)
@@ -1248,12 +1278,6 @@ class GPT(nn.Module):
         for i, ve in enumerate(self.value_embeds):
             ve.weight.label = f've{i}'  # ve0, ve1, ve2, ve3, ve4
         
-        # parameter banks for attention and value embedding gate weights
-        self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
-        self.attn_gate_bank.label = 'attn_gate_bank'
-        self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
-        self.ve_gate_bank.label = 've_gate_bank'
-
         # -----------------------------------
         # Parameter banks for sharded optimization, by @chrisjmccormick
 
@@ -1262,6 +1286,12 @@ class GPT(nn.Module):
         self.attn_layer_indices = [i for i in range(num_layers) if i != 6]
         # All layers have MLP (At 11 layers--dropped first layer @EmelyanenkoK)
         self.mlp_layer_indices = list(range(num_layers))
+
+        # parameter banks for attention and value embedding gate weights
+        self.attn_gate_bank = nn.Parameter(torch.zeros(len(self.attn_layer_indices), num_heads, 12))
+        self.attn_gate_bank.label = 'attn_gate_bank'
+        self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
+        self.ve_gate_bank.label = 've_gate_bank'
 
         hdim = num_heads * head_dim
         mlp_hdim = 4 * model_dim
@@ -1361,12 +1391,17 @@ class GPT(nn.Module):
         # unpack schedule_cfg
         mtp_weights, ws_short, ws_long = schedule_cfg.mtp_weights, schedule_cfg.ws_short, schedule_cfg.ws_long
 
-        # set configs
+        # Keep legacy skip/backout behavior for the 11-layer track model.
+        if self.num_layers == 11:
+            skip_in = [3]
+            skip_out = [6]
+            backout_layer = 7
+        else:
+            skip_in = []
+            skip_out = []
+            backout_layer = None
         skip_connections = []
-        skip_in = [3] # long attention window on layer 3
-        skip_out = [6] # no attn op on layer 6
         x_backout = None
-        backout_layer = 7
 
         # set lambdas
         resid_lambdas = self.scalars[: 1 * self.num_layers]
@@ -1380,7 +1415,12 @@ class GPT(nn.Module):
         # set block masks and key shift
         short_bm = ws_short * args.block_size
         long_bm = ws_long * args.block_size
-        bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
+        if self.num_layers == 11:
+            bm_sizes = [short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
+        else:
+            bm_sizes = [short_bm] * self.num_layers
+            if self.num_layers > 0:
+                bm_sizes[min(3, self.num_layers - 1)] = long_bm
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==long_bm for b in bm_sizes] # apply partial key offset to long windows
 
@@ -1389,9 +1429,19 @@ class GPT(nn.Module):
         x0_bigram = self.bigram_embed(bigram_input_seq)[None]
         
         # Value embeddings - always computed (not precomputed)
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 01 ... 234 structure on token value embeddings by @photomz
-        ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
+        ve_bank = [value_embed(input_seq) for value_embed in self.value_embeds]
+        if self.num_layers == 11:
+            # 01 ... 234 structure on token value embeddings by @photomz
+            ve = [ve_bank[0], ve_bank[1]] + [None] * (self.num_layers - 5) + [ve_bank[2], ve_bank[3], ve_bank[4]]
+        else:
+            ve = [None] * self.num_layers
+            if self.num_layers >= 1:
+                ve[0] = ve_bank[0]
+            if self.num_layers >= 2:
+                ve[1] = ve_bank[1]
+            tail_count = min(3, max(0, self.num_layers - 2))
+            for idx in range(tail_count):
+                ve[self.num_layers - tail_count + idx] = ve_bank[2 + idx]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1400,10 +1450,23 @@ class GPT(nn.Module):
         x = x0 = norm(x[None])
 
         # unbind gate banks to avoid select_backwards kernel
-        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
+        ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)]
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
-        attn_gates = ag[:6] + [None] + ag[6:]
-        ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
+        if self.num_layers == 11:
+            attn_gates = ag[:6] + [None] + ag[6:]
+            ve_gates = [veg[0], veg[1]] + [None] * (self.num_layers - 5) + [veg[2], veg[3], veg[4]]
+        else:
+            attn_gates = [None] * self.num_layers
+            for layer_idx, bank_idx in self.layer_to_attn_idx.items():
+                attn_gates[layer_idx] = ag[bank_idx]
+            ve_gates = [None] * self.num_layers
+            if self.num_layers >= 1:
+                ve_gates[0] = veg[0]
+            if self.num_layers >= 2:
+                ve_gates[1] = veg[1]
+            tail_count = min(3, max(0, self.num_layers - 2))
+            for idx in range(tail_count):
+                ve_gates[self.num_layers - tail_count + idx] = veg[2 + idx]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
 
@@ -1440,11 +1503,12 @@ class GPT(nn.Module):
             x = self.blocks[i](x, attn_args, qkvo_w, c_fc, c_proj)
             if i in skip_in:
                 skip_connections.append(x)
-            if i == backout_layer:
+            if backout_layer is not None and i == backout_layer:
                 x_backout = x
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
-        x -= backout_lambda * x_backout
+        if backout_layer is not None and x_backout is not None:
+            x -= backout_lambda * x_backout
         x = norm(x)
         logits = self.lm_head(x)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
@@ -1685,19 +1749,39 @@ def get_ws(step: int):
 # Runtime flag toggled by validation stop-rule when distillation is active.
 # Set after kd_cfg is parsed from env.
 kd_runtime_active = False
+kd_runtime_stop_step: int | None = None
 
 
 def get_kd_lr_multiplier(step: int) -> float:
-    if not kd_cfg.lr_boost_enabled or not kd_runtime_active:
-        return 1.0
-    x = min(1.0, step / max(1, args.num_scheduled_iterations))
-    if x < kd_cfg.lr_boost_hold_frac:
-        return kd_cfg.lr_boost_mult
-    if x < kd_cfg.lr_boost_drop_to_base_frac:
-        span = kd_cfg.lr_boost_drop_to_base_frac - kd_cfg.lr_boost_hold_frac
-        mix = (x - kd_cfg.lr_boost_hold_frac) / max(span, 1e-12)
-        return kd_cfg.lr_boost_mult + (1.0 - kd_cfg.lr_boost_mult) * mix
-    return 1.0
+    mult = 1.0
+    if kd_cfg.lr_boost_enabled and kd_runtime_active:
+        if kd_cfg.lr_boost_until_stop:
+            mult = kd_cfg.lr_boost_mult
+        else:
+            x = min(1.0, step / max(1, args.num_scheduled_iterations))
+            if x < kd_cfg.lr_boost_hold_frac:
+                mult = kd_cfg.lr_boost_mult
+            elif x < kd_cfg.lr_boost_drop_to_base_frac:
+                span = kd_cfg.lr_boost_drop_to_base_frac - kd_cfg.lr_boost_hold_frac
+                mix = (x - kd_cfg.lr_boost_hold_frac) / max(span, 1e-12)
+                mult = kd_cfg.lr_boost_mult + (1.0 - kd_cfg.lr_boost_mult) * mix
+            else:
+                mult = 1.0
+
+    if (
+        kd_cfg.enabled
+        and kd_cfg.lr_post_stop_enabled
+        and kd_runtime_stop_step is not None
+        and step >= kd_runtime_stop_step
+    ):
+        if kd_cfg.lr_post_stop_blend_steps == 0:
+            post_mult = kd_cfg.lr_post_stop_mult
+        else:
+            stop_offset = step - kd_runtime_stop_step + 1
+            blend = min(1.0, stop_offset / max(1, kd_cfg.lr_post_stop_blend_steps))
+            post_mult = 1.0 + (kd_cfg.lr_post_stop_mult - 1.0) * blend
+        mult *= post_mult
+    return mult
 
 
 # learning rate schedule: tied to batch size schedule, with cooldown at the end.
@@ -1733,12 +1817,108 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
     return momentum
 
 
-def compute_kd_soft_loss(student_logits: Tensor, teacher_logits: Tensor, temperature: float) -> Tensor:
+def compute_kd_soft_loss(
+    student_logits: Tensor,
+    teacher_logits: Tensor,
+    temperature: float,
+    token_chunk_size: int = 0,
+    topk: int = 0,
+    token_stride: int = 1,
+    fp32: bool = True,
+    log_target: bool = True,
+) -> Tensor:
     """Token-level logits distillation loss (KL with temperature scaling)."""
     vocab_size = student_logits.size(-1)
-    student_log_probs = F.log_softmax(student_logits.float().view(-1, vocab_size) / temperature, dim=-1)
-    teacher_probs = F.softmax(teacher_logits.float().view(-1, vocab_size) / temperature, dim=-1)
-    return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
+    student_flat = student_logits.view(-1, vocab_size)
+    teacher_flat = teacher_logits.view(-1, vocab_size)
+    if fp32:
+        student_flat = student_flat.float()
+        teacher_flat = teacher_flat.float()
+    if token_stride > 1:
+        student_flat = student_flat[::token_stride]
+        teacher_flat = teacher_flat[::token_stride]
+    total_tokens = student_flat.size(0)
+    if total_tokens == 0:
+        return student_logits.new_zeros(())
+    if topk > 0:
+        k = min(topk, vocab_size)
+        student_scaled = student_flat / temperature
+        teacher_scaled = teacher_flat / temperature
+        if token_chunk_size <= 0 or token_chunk_size >= total_tokens:
+            teacher_top_vals, teacher_top_idx = torch.topk(teacher_scaled, k=k, dim=-1)
+            student_log_norm = torch.logsumexp(student_scaled, dim=-1, keepdim=True)
+            student_sel = student_scaled.gather(dim=-1, index=teacher_top_idx)
+            student_log_probs_sel = student_sel - student_log_norm
+            if log_target:
+                teacher_log_probs = F.log_softmax(teacher_top_vals, dim=-1)
+                return F.kl_div(
+                    student_log_probs_sel,
+                    teacher_log_probs,
+                    reduction="batchmean",
+                    log_target=True,
+                ) * (temperature ** 2)
+            teacher_probs = F.softmax(teacher_top_vals, dim=-1)
+            return F.kl_div(student_log_probs_sel, teacher_probs, reduction="batchmean") * (temperature ** 2)
+        kl_sum = student_flat.new_zeros(())
+        for start in range(0, total_tokens, token_chunk_size):
+            end = min(start + token_chunk_size, total_tokens)
+            s_chunk = student_scaled[start:end]
+            t_chunk = teacher_scaled[start:end]
+            teacher_top_vals, teacher_top_idx = torch.topk(t_chunk, k=k, dim=-1)
+            student_log_norm = torch.logsumexp(s_chunk, dim=-1, keepdim=True)
+            student_sel = s_chunk.gather(dim=-1, index=teacher_top_idx)
+            student_log_probs_sel = student_sel - student_log_norm
+            if log_target:
+                teacher_log_probs = F.log_softmax(teacher_top_vals, dim=-1)
+                kl_sum += F.kl_div(
+                    student_log_probs_sel,
+                    teacher_log_probs,
+                    reduction="sum",
+                    log_target=True,
+                )
+            else:
+                teacher_probs = F.softmax(teacher_top_vals, dim=-1)
+                kl_sum += F.kl_div(student_log_probs_sel, teacher_probs, reduction="sum")
+        return (kl_sum / total_tokens) * (temperature ** 2)
+    if token_chunk_size <= 0 or token_chunk_size >= total_tokens:
+        student_log_probs = F.log_softmax(student_flat / temperature, dim=-1)
+        if log_target:
+            teacher_log_probs = F.log_softmax(teacher_flat / temperature, dim=-1)
+            return F.kl_div(
+                student_log_probs,
+                teacher_log_probs,
+                reduction="batchmean",
+                log_target=True,
+            ) * (temperature ** 2)
+        teacher_probs = F.softmax(teacher_flat / temperature, dim=-1)
+        return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
+
+    kl_sum = student_flat.new_zeros(())
+    for start in range(0, total_tokens, token_chunk_size):
+        end = min(start + token_chunk_size, total_tokens)
+        student_log_probs = F.log_softmax(student_flat[start:end] / temperature, dim=-1)
+        if log_target:
+            teacher_log_probs = F.log_softmax(teacher_flat[start:end] / temperature, dim=-1)
+            kl_sum += F.kl_div(
+                student_log_probs,
+                teacher_log_probs,
+                reduction="sum",
+                log_target=True,
+            )
+        else:
+            teacher_probs = F.softmax(teacher_flat[start:end] / temperature, dim=-1)
+            kl_sum += F.kl_div(student_log_probs, teacher_probs, reduction="sum")
+    return (kl_sum / total_tokens) * (temperature ** 2)
+
+
+def apply_kd_dynamic_norm(hard_loss: Tensor, soft_loss: Tensor) -> Tensor:
+    """Scale KD soft loss to CE scale using a detached per-step ratio."""
+    if not kd_cfg.dynamic_norm:
+        return soft_loss
+    scale = (hard_loss.detach() / (soft_loss.detach().abs() + kd_cfg.dynamic_norm_eps)).clamp(
+        min=0.0, max=kd_cfg.dynamic_norm_clip_max
+    )
+    return soft_loss * scale
 
 
 class TrainingManager():
@@ -1941,17 +2121,27 @@ class Hyperparameters:
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
     # bigram hash embedding
-    bigram_vocab_size = 50304 * 5
+    bigram_vocab_size: int = 50304 * 5
 
 args = Hyperparameters()
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
 args.val_files = os.path.join(data_path, args.val_files)
+args.bigram_vocab_size = max(2, env_int("BIGRAM_VOCAB_SIZE", args.bigram_vocab_size))
 
 # Optional runtime overrides for repeated CE/KD experimentation without code edits.
 args.save_checkpoint = env_flag("SAVE_CHECKPOINT", args.save_checkpoint)
+save_best_checkpoint = env_flag("SAVE_BEST_CHECKPOINT", args.save_checkpoint)
 args.val_loss_every = env_int("VAL_LOSS_EVERY", args.val_loss_every)
+early_stop_target_val_raw = os.environ.get("EARLY_STOP_TARGET_VAL")
+early_stop_target_val = float(early_stop_target_val_raw) if early_stop_target_val_raw not in (None, "") else None
+early_stop_consecutive = env_int("EARLY_STOP_CONSECUTIVE", 1)
+early_stop_min_step = env_int("EARLY_STOP_MIN_STEP", 0)
+if early_stop_consecutive < 1:
+    raise ValueError("EARLY_STOP_CONSECUTIVE must be >= 1.")
+if early_stop_min_step < 0:
+    raise ValueError("EARLY_STOP_MIN_STEP must be >= 0.")
 if "RUN_ID" in os.environ:
     args.run_id = os.environ["RUN_ID"]
 if "NUM_ITERATIONS" in os.environ:
@@ -1970,25 +2160,85 @@ args.val_batch_size = env_int("VAL_BATCH_SIZE", args.val_batch_size)
 args.train_bs_extension = env_int("TRAIN_BS_EXTENSION", args.train_bs_extension)
 args.train_bs_schedule = env_int_tuple("TRAIN_BS_SCHEDULE", args.train_bs_schedule)
 
+# Student architecture for this trainer path (track-1 class).
+# Defaults remain the official 127M-track shape. Optional env overrides allow
+# smaller-width experiments while preserving the same training stack.
+STUDENT_NUM_LAYERS = env_int("MODEL_NUM_LAYERS", 11)
+STUDENT_NUM_HEADS = env_int("MODEL_NUM_HEADS", 6)
+STUDENT_HEAD_DIM = env_int("MODEL_HEAD_DIM", 128)
+STUDENT_MODEL_DIM = env_int("MODEL_DIM", 768)
+MODEL_AUTO_PICK = env_flag("MODEL_AUTO_PICK", False)
+MODEL_TARGET_PARAMS_M = env_float("MODEL_TARGET_PARAMS_M", 127.0)
+MODEL_AUTO_PICK_MIN_PARAMS_M = env_float("MODEL_AUTO_PICK_MIN_PARAMS_M", 0.0)
+MODEL_AUTO_PICK_MAX_PARAMS_M = env_float("MODEL_AUTO_PICK_MAX_PARAMS_M", 0.0)
+
 
 @dataclass
 class KDConfig:
     enabled: bool = env_flag("KD_ENABLED", False)
     teacher_checkpoint: str = os.environ.get("KD_TEACHER_CKPT", "")
+    random_teacher: bool = env_flag("KD_RANDOM_TEACHER", False)
+    random_model_teacher: bool = env_flag("KD_RANDOM_MODEL_TEACHER", False)
+    teacher_infer_only: bool = env_flag("KD_TEACHER_INFER_ONLY", False)
+    # Benchmark mode: run only teacher forward passes on train microbatches.
+    # This isolates teacher inference cost from student training/backward.
+    teacher_bench_only: bool = env_flag("KD_TEACHER_BENCH_ONLY", False)
     alpha: float = env_float("KD_ALPHA", 0.45)
     temperature: float = env_float("KD_TEMPERATURE", 1.0)
     stop_mode: str = os.environ.get("KD_STOP_MODE", "val_margin")
     stop_margin: float = env_float("KD_STOP_MARGIN", 0.05)
     stop_min_step: int = env_int("KD_STOP_MIN_STEP", 250)
+    stop_teacher_val_ref: float | None = env_optional_float("KD_STOP_TEACHER_VAL_REF")
     lr_boost_enabled: bool = env_flag("KD_LR_BOOST_ENABLED", False)
     lr_boost_mult: float = env_float("KD_LR_BOOST_MULT", 1.4)
+    lr_boost_until_stop: bool = env_flag("KD_LR_BOOST_UNTIL_STOP", True)
     lr_boost_hold_frac: float = env_float("KD_LR_BOOST_HOLD_FRAC", 0.20)
     lr_boost_drop_to_base_frac: float = env_float("KD_LR_BOOST_DROP_TO_BASE_FRAC", 0.30)
+    lr_post_stop_enabled: bool = env_flag("KD_LR_POST_STOP_ENABLED", True)
+    lr_post_stop_mult: float = env_float("KD_LR_POST_STOP_MULT", 0.35)
+    lr_post_stop_blend_steps: int = env_int("KD_LR_POST_STOP_BLEND_STEPS", 0)
+    dynamic_norm: bool = env_flag("KD_DYNAMIC_NORM", True)
+    dynamic_norm_eps: float = env_float("KD_DYNAMIC_NORM_EPS", 1e-8)
+    dynamic_norm_clip_max: float = env_float("KD_DYNAMIC_NORM_CLIP_MAX", 10.0)
+    # For wall-time speed we default to allowing the normal attention backend
+    # (FA path when available). Set KD_TEACHER_FORCE_SDPA=1 to force SDPA.
+    teacher_force_sdpa: bool = env_flag("KD_TEACHER_FORCE_SDPA", False)
+    compile_teacher: bool = env_flag("KD_COMPILE_TEACHER", True)
+    soft_loss_token_chunk: int = env_int("KD_SOFT_LOSS_TOKEN_CHUNK", 4096)
+    soft_loss_topk: int = env_int("KD_SOFT_LOSS_TOPK", 0)
+    soft_loss_token_stride: int = env_int("KD_SOFT_LOSS_TOKEN_STRIDE", 1)
+    # KD soft-loss compute controls. fp32/log_target preserve historical behavior;
+    # set KD_SOFT_LOSS_FP32=0 to reduce memory pressure.
+    soft_loss_fp32: bool = env_flag("KD_SOFT_LOSS_FP32", True)
+    soft_loss_log_target: bool = env_flag("KD_SOFT_LOSS_LOG_TARGET", True)
+    # Optional low-overhead CUDA-event profiling for KD component timings.
+    profile_timing: bool = env_flag("KD_PROFILE_TIMING", False)
+    # KD sparsity controls for speed: keep defaults equivalent to dense KD.
+    apply_every_steps: int = env_int("KD_APPLY_EVERY_STEPS", 1)
+    microbatches_per_step: int = env_int("KD_MICROBATCHES_PER_STEP", 0)
+    teacher_num_layers: int = env_int("KD_TEACHER_NUM_LAYERS", STUDENT_NUM_LAYERS)
+    teacher_num_heads: int = env_int("KD_TEACHER_NUM_HEADS", STUDENT_NUM_HEADS)
+    teacher_head_dim: int = env_int("KD_TEACHER_HEAD_DIM", STUDENT_HEAD_DIM)
+    teacher_model_dim: int = env_int("KD_TEACHER_MODEL_DIM", STUDENT_MODEL_DIM)
+    teacher_auto_pick: bool = env_flag("KD_TEACHER_AUTO_PICK", False)
+    teacher_target_params_m: float = env_float("KD_TEACHER_TARGET_PARAMS_M", 25.4)
 
 
 kd_cfg = KDConfig()
+kd_mode = "disabled"
 if kd_cfg.enabled:
-    if not kd_cfg.teacher_checkpoint:
+    if kd_cfg.random_teacher and kd_cfg.random_model_teacher:
+        raise ValueError("Set only one of KD_RANDOM_TEACHER=1 or KD_RANDOM_MODEL_TEACHER=1.")
+    if kd_cfg.teacher_infer_only and kd_cfg.random_teacher:
+        raise ValueError("KD_TEACHER_INFER_ONLY=1 requires a teacher model (real or random_model), not KD_RANDOM_TEACHER.")
+    if kd_cfg.teacher_bench_only and kd_cfg.random_teacher:
+        raise ValueError("KD_TEACHER_BENCH_ONLY=1 requires a teacher model (real or random_model), not KD_RANDOM_TEACHER.")
+    kd_mode = (
+        "random_teacher"
+        if kd_cfg.random_teacher
+        else ("random_model_teacher" if kd_cfg.random_model_teacher else "real_teacher")
+    )
+    if not kd_cfg.random_teacher and not kd_cfg.random_model_teacher and not kd_cfg.teacher_checkpoint:
         raise ValueError("KD_ENABLED=1 requires KD_TEACHER_CKPT to be set.")
     if kd_cfg.alpha < 0.0 or kd_cfg.alpha > 1.0:
         raise ValueError("KD_ALPHA must be in [0, 1].")
@@ -2006,14 +2256,170 @@ if kd_cfg.lr_boost_hold_frac >= kd_cfg.lr_boost_drop_to_base_frac:
     raise ValueError("KD_LR_BOOST_HOLD_FRAC must be < KD_LR_BOOST_DROP_TO_BASE_FRAC.")
 if kd_cfg.lr_boost_drop_to_base_frac > 1.0:
     raise ValueError("KD_LR_BOOST_DROP_TO_BASE_FRAC must be <= 1.")
+if kd_cfg.lr_post_stop_mult <= 0.0:
+    raise ValueError("KD_LR_POST_STOP_MULT must be > 0.")
+if kd_cfg.lr_post_stop_blend_steps < 0:
+    raise ValueError("KD_LR_POST_STOP_BLEND_STEPS must be >= 0.")
+if kd_cfg.dynamic_norm_eps <= 0.0:
+    raise ValueError("KD_DYNAMIC_NORM_EPS must be > 0.")
+if kd_cfg.dynamic_norm_clip_max <= 0.0:
+    raise ValueError("KD_DYNAMIC_NORM_CLIP_MAX must be > 0.")
+if kd_cfg.enabled and kd_cfg.compile_teacher and DISABLE_COMPILE:
+    raise ValueError("KD_COMPILE_TEACHER=1 requires DISABLE_COMPILE=0.")
+if kd_cfg.teacher_bench_only and not kd_cfg.enabled:
+    raise ValueError("KD_TEACHER_BENCH_ONLY=1 requires KD_ENABLED=1.")
+if kd_cfg.soft_loss_topk < 0:
+    raise ValueError("KD_SOFT_LOSS_TOPK must be >= 0.")
+if kd_cfg.soft_loss_token_stride < 1:
+    raise ValueError("KD_SOFT_LOSS_TOKEN_STRIDE must be >= 1.")
+if kd_cfg.apply_every_steps < 1:
+    raise ValueError("KD_APPLY_EVERY_STEPS must be >= 1.")
+if kd_cfg.microbatches_per_step < 0:
+    raise ValueError("KD_MICROBATCHES_PER_STEP must be >= 0.")
+if STUDENT_NUM_LAYERS <= 0:
+    raise ValueError("MODEL_NUM_LAYERS must be positive.")
+if STUDENT_NUM_HEADS <= 0 or STUDENT_HEAD_DIM <= 0 or STUDENT_MODEL_DIM <= 0:
+    raise ValueError("MODEL_* dimensions must be positive.")
+if STUDENT_NUM_HEADS % 2 != 0:
+    raise ValueError("MODEL_NUM_HEADS must be even (paired-head path requires even heads).")
+if STUDENT_HEAD_DIM % 4 != 0:
+    raise ValueError("MODEL_HEAD_DIM must be divisible by 4 for Yarn rotary compatibility.")
+if STUDENT_NUM_HEADS * STUDENT_HEAD_DIM != STUDENT_MODEL_DIM:
+    raise ValueError("MODEL_DIM must equal MODEL_NUM_HEADS * MODEL_HEAD_DIM.")
+if MODEL_TARGET_PARAMS_M <= 0.0:
+    raise ValueError("MODEL_TARGET_PARAMS_M must be > 0.")
+if MODEL_AUTO_PICK_MIN_PARAMS_M > 0.0 and MODEL_AUTO_PICK_MAX_PARAMS_M > 0.0 and MODEL_AUTO_PICK_MIN_PARAMS_M > MODEL_AUTO_PICK_MAX_PARAMS_M:
+    raise ValueError("MODEL_AUTO_PICK_MIN_PARAMS_M must be <= MODEL_AUTO_PICK_MAX_PARAMS_M.")
+if kd_cfg.teacher_num_layers <= 0 or kd_cfg.teacher_num_heads <= 0 or kd_cfg.teacher_head_dim <= 0 or kd_cfg.teacher_model_dim <= 0:
+    raise ValueError("Teacher architecture dimensions must be positive.")
+if kd_cfg.teacher_num_heads % 2 != 0:
+    raise ValueError("KD_TEACHER_NUM_HEADS must be even (paired-head path requires even heads).")
+if kd_cfg.teacher_head_dim % 4 != 0:
+    raise ValueError("KD_TEACHER_HEAD_DIM must be divisible by 4 for Yarn rotary compatibility.")
+if kd_cfg.teacher_num_heads * kd_cfg.teacher_head_dim != kd_cfg.teacher_model_dim:
+    raise ValueError("Teacher architecture must satisfy teacher_model_dim == teacher_num_heads * teacher_head_dim.")
+if kd_cfg.teacher_target_params_m <= 0.0:
+    raise ValueError("KD_TEACHER_TARGET_PARAMS_M must be > 0.")
 
 kd_runtime_active = bool(kd_cfg.enabled)
+kd_runtime_stop_step = None
+
+MODEL_PARAM_GRID: list[tuple[int, int, int, int]] = [
+    # Shallow, kernel-compatible candidates around ~25-30M.
+    (2, 2, 20, 40),
+    (2, 4, 12, 48),
+    (2, 4, 16, 64),
+    (4, 2, 20, 40),
+    (5, 2, 20, 40),
+    (6, 2, 20, 40),
+    (7, 2, 20, 40),
+    (8, 2, 20, 40),
+    (4, 4, 12, 48),
+    (5, 4, 12, 48),
+    (6, 4, 12, 48),
+    (7, 4, 12, 48),
+    (8, 4, 12, 48),
+    (4, 4, 16, 64),
+    (5, 4, 16, 64),
+    (6, 4, 16, 64),
+    (7, 4, 16, 64),
+    (8, 4, 16, 64),
+    # 11-layer fallback candidates.
+    (11, 2, 16, 32),
+    (11, 4, 8, 32),
+    (11, 2, 20, 40),
+    (11, 4, 10, 40),
+    (11, 2, 24, 48),
+    (11, 4, 12, 48),
+    (11, 6, 8, 48),
+    (11, 2, 32, 64),
+    (11, 4, 16, 64),
+    (11, 8, 8, 64),
+    (11, 2, 40, 80),
+    (11, 4, 20, 80),
+    (11, 2, 48, 96),
+    (11, 4, 24, 96),
+    (11, 6, 16, 96),
+    (11, 4, 32, 128),
+    (11, 8, 16, 128),
+    (11, 4, 40, 160),
+    (11, 4, 48, 192),
+    (11, 6, 24, 144),
+    (11, 6, 32, 192),
+    # Existing wider candidates
+    (11, 4, 64, 256),
+    (11, 4, 80, 320),
+    (11, 6, 56, 336),
+    (11, 6, 64, 384),
+    (11, 8, 56, 448),
+    (11, 8, 64, 512),
+    (11, 10, 64, 640),
+    (11, 6, 128, 768),
+]
+
+KD_TEACHER_PARAM_GRID: list[tuple[int, int, int, int]] = MODEL_PARAM_GRID
+
+
+def model_param_count(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def pick_arch(
+    vocab_size: int,
+    max_seq_len: int,
+    target_params_m: float,
+    grid: list[tuple[int, int, int, int]],
+) -> tuple[tuple[int, int, int, int], float, list[tuple[int, int, int, int, float, float]]]:
+    best_arch = grid[0]
+    best_params = -1
+    best_dist = float("inf")
+    target_params = target_params_m * 1_000_000.0
+    candidates: list[tuple[int, int, int, int, float, float]] = []
+    for arch in grid:
+        layers, heads, head_dim, model_dim = arch
+        if heads % 2 != 0:
+            raise ValueError(f"Invalid auto-pick arch {arch}: num_heads must be even.")
+        if head_dim % 4 != 0:
+            raise ValueError(f"Invalid auto-pick arch {arch}: head_dim must be divisible by 4.")
+        if heads * head_dim != model_dim:
+            raise ValueError(f"Invalid auto-pick arch {arch}: model_dim must equal heads * head_dim.")
+        candidate = GPT(
+            vocab_size=vocab_size,
+            num_layers=layers,
+            num_heads=heads,
+            head_dim=head_dim,
+            model_dim=model_dim,
+            max_seq_len=max_seq_len,
+        )
+        params = model_param_count(candidate)
+        del candidate
+        gc.collect()
+        dist_to_target = abs(params - target_params)
+        params_m = params / 1_000_000.0
+        dist_m = dist_to_target / 1_000_000.0
+        candidates.append((layers, heads, head_dim, model_dim, params_m, dist_m))
+        if dist_to_target < best_dist:
+            best_dist = dist_to_target
+            best_params = params
+            best_arch = arch
+    return best_arch, best_params / 1_000_000.0, candidates
+
+
+def pick_teacher_arch(
+    vocab_size: int,
+    max_seq_len: int,
+    target_params_m: float,
+) -> tuple[tuple[int, int, int, int], float, list[tuple[int, int, int, int, float, float]]]:
+    return pick_arch(vocab_size=vocab_size, max_seq_len=max_seq_len, target_params_m=target_params_m, grid=KD_TEACHER_PARAM_GRID)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+if 8 % world_size != 0 and "GRAD_ACCUM_STEPS" not in os.environ:
+    raise AssertionError("world_size must be a divisor of 8 unless GRAD_ACCUM_STEPS is explicitly set")
+grad_accum_steps = env_int("GRAD_ACCUM_STEPS", 8 // world_size)
+if grad_accum_steps <= 0:
+    raise ValueError("GRAD_ACCUM_STEPS must be >= 1")
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -2042,25 +2448,71 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
+print0(f"FLASH_ATTN_BACKEND={FLASH_ATTN_BACKEND} HAS_FLASH_ATTN={HAS_FLASH_ATTN}")
 print0(f"DISABLE_COMPILE={DISABLE_COMPILE}")
+print0(f"SKIP_WARMUP={SKIP_WARMUP}")
+print0(f"grad_accum_steps={grad_accum_steps}")
 print0(f"SAVE_CHECKPOINT={args.save_checkpoint}")
+print0(f"SAVE_BEST_CHECKPOINT={save_best_checkpoint}")
 print0(f"num_iterations={args.num_iterations} num_scheduled_iterations={args.num_scheduled_iterations} num_extension_iterations={args.num_extension_iterations}")
 print0(
-    "KD enabled={} alpha={} temp={} stop_mode={} stop_margin={} stop_min_step={} lr_boost={} lr_boost_mult={} lr_boost_hold_frac={} lr_boost_drop_to_base_frac={}".format(
+    f"EARLY_STOP_TARGET_VAL={early_stop_target_val} "
+    f"EARLY_STOP_CONSECUTIVE={early_stop_consecutive} "
+    f"EARLY_STOP_MIN_STEP={early_stop_min_step}"
+)
+print0(
+    f"Model overrides: MODEL_AUTO_PICK={MODEL_AUTO_PICK} MODEL_TARGET_PARAMS_M={MODEL_TARGET_PARAMS_M} "
+    f"MODEL_NUM_LAYERS={STUDENT_NUM_LAYERS} MODEL_NUM_HEADS={STUDENT_NUM_HEADS} MODEL_HEAD_DIM={STUDENT_HEAD_DIM} MODEL_DIM={STUDENT_MODEL_DIM} "
+    f"BIGRAM_VOCAB_SIZE={args.bigram_vocab_size}"
+)
+print0(
+    "KD enabled={} mode={} alpha={} temp={} stop_mode={} stop_margin={} stop_min_step={} stop_teacher_val_ref={} lr_boost={} lr_boost_mult={} lr_boost_until_stop={} lr_boost_hold_frac={} lr_boost_drop_to_base_frac={} lr_post_stop_enabled={} lr_post_stop_mult={} lr_post_stop_blend_steps={} dynamic_norm={} dynamic_norm_eps={} dynamic_norm_clip_max={} teacher_force_sdpa={} compile_teacher={} soft_loss_token_chunk={} soft_loss_topk={} soft_loss_token_stride={} soft_loss_fp32={} soft_loss_log_target={} kd_profile_timing={} kd_apply_every_steps={} kd_microbatches_per_step={} teacher_infer_only={} teacher_auto_pick={} teacher_target_params_m={} teacher_layers={} teacher_heads={} teacher_head_dim={} teacher_model_dim={}".format(
         kd_cfg.enabled,
+        kd_mode,
         kd_cfg.alpha,
         kd_cfg.temperature,
         kd_cfg.stop_mode,
         kd_cfg.stop_margin,
         kd_cfg.stop_min_step,
+        kd_cfg.stop_teacher_val_ref,
         kd_cfg.lr_boost_enabled,
         kd_cfg.lr_boost_mult,
+        kd_cfg.lr_boost_until_stop,
         kd_cfg.lr_boost_hold_frac,
         kd_cfg.lr_boost_drop_to_base_frac,
+        kd_cfg.lr_post_stop_enabled,
+        kd_cfg.lr_post_stop_mult,
+        kd_cfg.lr_post_stop_blend_steps,
+        kd_cfg.dynamic_norm,
+        kd_cfg.dynamic_norm_eps,
+        kd_cfg.dynamic_norm_clip_max,
+        kd_cfg.teacher_force_sdpa,
+        kd_cfg.compile_teacher,
+        kd_cfg.soft_loss_token_chunk,
+        kd_cfg.soft_loss_topk,
+        kd_cfg.soft_loss_token_stride,
+        kd_cfg.soft_loss_fp32,
+        kd_cfg.soft_loss_log_target,
+        kd_cfg.profile_timing,
+        kd_cfg.apply_every_steps,
+        kd_cfg.microbatches_per_step,
+        kd_cfg.teacher_infer_only,
+        kd_cfg.teacher_auto_pick,
+        kd_cfg.teacher_target_params_m,
+        kd_cfg.teacher_num_layers,
+        kd_cfg.teacher_num_heads,
+        kd_cfg.teacher_head_dim,
+        kd_cfg.teacher_model_dim,
     )
 )
 if kd_cfg.enabled:
-    print0(f"KD teacher checkpoint: {kd_cfg.teacher_checkpoint}")
+    if kd_cfg.random_teacher:
+        print0("KD teacher checkpoint: <random_teacher_mode>")
+    elif kd_cfg.random_model_teacher:
+        print0("KD teacher checkpoint: <random_model_teacher_mode>")
+    else:
+        print0(f"KD teacher checkpoint: {kd_cfg.teacher_checkpoint}")
+    print0(f"KD teacher bench-only mode: {kd_cfg.teacher_bench_only}", console=True)
 
 def nvidia_smi():
     import subprocess  # avoid top level import
@@ -2068,13 +2520,65 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
+model_max_seq_len = args.val_batch_size // (grad_accum_steps * world_size)
+student_arch = (
+    STUDENT_NUM_LAYERS,
+    STUDENT_NUM_HEADS,
+    STUDENT_HEAD_DIM,
+    STUDENT_MODEL_DIM,
+)
+student_auto_pick_used = False
+student_auto_pick_params_m = 0.0
+student_auto_pick_candidates: list[tuple[int, int, int, int, float, float]] = []
+if MODEL_AUTO_PICK:
+    student_arch, student_auto_pick_params_m, student_auto_pick_candidates = pick_arch(
+        vocab_size=50257,
+        max_seq_len=model_max_seq_len,
+        target_params_m=MODEL_TARGET_PARAMS_M,
+        grid=MODEL_PARAM_GRID,
+    )
+    student_auto_pick_used = True
+    if MODEL_AUTO_PICK_MAX_PARAMS_M > 0.0 and not (MODEL_AUTO_PICK_MIN_PARAMS_M <= student_auto_pick_params_m <= MODEL_AUTO_PICK_MAX_PARAMS_M):
+        closest = sorted(student_auto_pick_candidates, key=lambda x: x[5])[:8]
+        closest_str = "; ".join(
+            "({},{},{},{}) {:.3f}M dist={:.3f}M".format(
+                c[0], c[1], c[2], c[3], c[4], c[5]
+            )
+            for c in closest
+        )
+        raise ValueError(
+            "MODEL_AUTO_PICK selected {:.3f}M outside allowed band [{:.3f}, {:.3f}]M. Closest candidates: {}".format(
+                student_auto_pick_params_m,
+                MODEL_AUTO_PICK_MIN_PARAMS_M,
+                MODEL_AUTO_PICK_MAX_PARAMS_M,
+                closest_str,
+            )
+        )
+
+teacher_arch = (
+    kd_cfg.teacher_num_layers,
+    kd_cfg.teacher_num_heads,
+    kd_cfg.teacher_head_dim,
+    kd_cfg.teacher_model_dim,
+)
+teacher_auto_pick_used = False
+teacher_auto_pick_params_m = 0.0
+teacher_auto_pick_candidates: list[tuple[int, int, int, int, float, float]] = []
+if kd_cfg.enabled and kd_cfg.random_model_teacher and kd_cfg.teacher_auto_pick:
+    teacher_arch, teacher_auto_pick_params_m, teacher_auto_pick_candidates = pick_teacher_arch(
+        vocab_size=50257,
+        max_seq_len=model_max_seq_len,
+        target_params_m=kd_cfg.teacher_target_params_m,
+    )
+    teacher_auto_pick_used = True
+
 model: nn.Module = GPT(
     vocab_size=50257,
-    num_layers=11,
-    num_heads=6,
-    head_dim=128,
-    model_dim=768,
-    max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    num_layers=student_arch[0],
+    num_heads=student_arch[1],
+    head_dim=student_arch[2],
+    model_dim=student_arch[3],
+    max_seq_len=model_max_seq_len,
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -2085,25 +2589,142 @@ model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
+student_params = model_param_count(model)
+print0(
+    "Student model config: layers={} heads={} head_dim={} model_dim={} params={} ({:.3f}M)".format(
+        student_arch[0],
+        student_arch[1],
+        student_arch[2],
+        student_arch[3],
+        student_params,
+        student_params / 1_000_000.0,
+    )
+)
+if student_auto_pick_used:
+    print0(
+        "Student model auto-pick target={:.3f}M selected=layers:{} heads:{} head_dim:{} model_dim:{} approx_params={:.3f}M".format(
+            MODEL_TARGET_PARAMS_M,
+            student_arch[0],
+            student_arch[1],
+            student_arch[2],
+            student_arch[3],
+            student_auto_pick_params_m,
+        ),
+        console=True,
+    )
+    print0("Student model auto-pick candidates (layers,heads,head_dim,model_dim,params_m,dist_to_target_m):", console=True)
+    for cand in sorted(student_auto_pick_candidates, key=lambda x: x[4]):
+        print0(
+            "  ({},{},{},{}) {:.3f}M dist={:.3f}M".format(
+                cand[0], cand[1], cand[2], cand[3], cand[4], cand[5]
+            ),
+            console=True,
+        )
+if kd_cfg.enabled and kd_cfg.random_model_teacher and teacher_auto_pick_used:
+    layers, heads, head_dim, model_dim = teacher_arch
+    print0(
+        "KD teacher auto-pick target={:.3f}M selected=layers:{} heads:{} head_dim:{} model_dim:{} approx_params={:.3f}M".format(
+            kd_cfg.teacher_target_params_m,
+            layers,
+            heads,
+            head_dim,
+            model_dim,
+            teacher_auto_pick_params_m,
+        ),
+        console=True,
+    )
+    print0("KD teacher auto-pick candidates (layers,heads,head_dim,model_dim,params_m,dist_to_target_m):", console=True)
+    for cand in sorted(teacher_auto_pick_candidates, key=lambda x: x[4]):
+        print0(
+            "  ({},{},{},{}) {:.3f}M dist={:.3f}M".format(
+                cand[0], cand[1], cand[2], cand[3], cand[4], cand[5]
+            ),
+            console=True,
+        )
 
 teacher_model: nn.Module | None = None
-if kd_cfg.enabled:
+teacher_compiled = False
+if kd_cfg.enabled and (not kd_cfg.random_teacher):
+    teacher_layers, teacher_heads, teacher_head_dim, teacher_model_dim = teacher_arch
     teacher_model = GPT(
         vocab_size=50257,
-        num_layers=11,
-        num_heads=6,
-        head_dim=128,
-        model_dim=768,
-        max_seq_len=args.val_batch_size // (grad_accum_steps * world_size),
+        num_layers=teacher_layers,
+        num_heads=teacher_heads,
+        head_dim=teacher_head_dim,
+        model_dim=teacher_model_dim,
+        max_seq_len=model_max_seq_len,
     ).cuda()
-    checkpoint = torch.load(kd_cfg.teacher_checkpoint, map_location=device)
-    if "model" not in checkpoint:
-        raise ValueError(f"Teacher checkpoint at {kd_cfg.teacher_checkpoint} is missing 'model' key.")
-    teacher_model.load_state_dict(checkpoint["model"], strict=True)
+    if kd_cfg.random_model_teacher:
+        # Keep random init as a minimal reproducible "2nd model inference" path.
+        teacher_model = teacher_model.to(torch.bfloat16)
+    else:
+        # Teacher checkpoints are produced by this same trainer and include trusted
+        # Python objects in optimizer/config state, so explicitly opt out of the
+        # PyTorch 2.6+ weights_only default here.
+        checkpoint = torch.load(kd_cfg.teacher_checkpoint, map_location=device, weights_only=False)
+        if "model" not in checkpoint:
+            raise ValueError(f"Teacher checkpoint at {kd_cfg.teacher_checkpoint} is missing 'model' key.")
+        teacher_state = checkpoint["model"]
+        if len(teacher_state) > 0 and next(iter(teacher_state.keys())).startswith("_orig_mod."):
+            teacher_state = {k.replace("_orig_mod.", "", 1): v for k, v in teacher_state.items()}
+        teacher_model.load_state_dict(teacher_state, strict=True)
+        teacher_model = teacher_model.to(torch.bfloat16)
     for param in teacher_model.parameters():
         param.requires_grad = False
     teacher_model.eval()
-    print0("Loaded teacher checkpoint successfully.", console=True)
+    if kd_cfg.compile_teacher and not kd_cfg.teacher_force_sdpa and not DISABLE_COMPILE:
+        # Compile teacher only when it can share the same fast attention backend path.
+        teacher_model = torch_compile(teacher_model, dynamic=False, fullgraph=True)
+        teacher_compiled = True
+    teacher_params = model_param_count(teacher_model)
+    print0(
+        "Teacher model config: layers={} heads={} head_dim={} model_dim={} params={} ({:.3f}M)".format(
+            teacher_layers,
+            teacher_heads,
+            teacher_head_dim,
+            teacher_model_dim,
+            teacher_params,
+            teacher_params / 1_000_000.0,
+        )
+    )
+    if kd_cfg.random_model_teacher:
+        print0("KD random model teacher mode enabled: using a randomly initialized teacher model.", console=True)
+    else:
+        print0("Loaded teacher checkpoint successfully.", console=True)
+    print0(f"Teacher compile enabled={teacher_compiled}", console=True)
+elif kd_cfg.enabled and kd_cfg.random_teacher:
+    print0("KD random teacher mode enabled: using synthetic teacher logits (no teacher checkpoint load).", console=True)
+
+teacher_force_sdpa = kd_cfg.enabled and not kd_cfg.random_teacher and kd_cfg.teacher_force_sdpa
+
+
+def teacher_forward(*args, **kwargs):
+    if teacher_model is None:
+        raise RuntimeError("teacher_forward called without initialized teacher_model.")
+    if not teacher_force_sdpa:
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            return teacher_model(*args, **kwargs)
+    global HAS_FLASH_ATTN
+    prev_has_flash_attn = HAS_FLASH_ATTN
+    HAS_FLASH_ATTN = (False if teacher_force_sdpa else prev_has_flash_attn)
+    try:
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            return teacher_model(*args, **kwargs)
+    finally:
+        HAS_FLASH_ATTN = prev_has_flash_attn
+
+
+def cuda_timed_call(enabled: bool, fn):
+    """Run fn() and return (output, elapsed_ms) with optional CUDA event timing."""
+    if not enabled:
+        return fn(), 0.0
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    out = fn()
+    end.record()
+    end.synchronize()
+    return out, float(start.elapsed_time(end))
 
 model: nn.Module = torch_compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
@@ -2111,60 +2732,125 @@ training_manager = TrainingManager(model)
 ########################################
 #            Warmup kernels            #
 ########################################
-print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizer=training_manager.get_state()) # save the initial state
-train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
-val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+if SKIP_WARMUP:
+    print0("Skipping compile/warmup block (SKIP_WARMUP=1).", console=True)
+else:
+    print0("Compiling model and warming up kernels (~7 minutes on first execution)", console=True)
+    # Warmup the training kernels, then re-initialize the state so we aren't cheating
+    initial_state = dict(model=copy.deepcopy(model.state_dict()),
+                         optimizer=training_manager.get_state()) # save the initial state
+    train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+    val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
 
-transition_steps = training_manager.get_transition_steps()
-# first few steps plus transitions
-warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0)) 
-print0(f"Sampling steps {warmup_steps} for warmup", console=True)
-for step in warmup_steps:
-    training_manager.advance_schedule(step)
-    model.eval()
-    with torch.no_grad():
-        inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+    transition_steps = training_manager.get_transition_steps()
+    # first few steps plus transitions
+    warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0)) 
+    print0(f"Sampling steps {warmup_steps} for warmup", console=True)
+    for step in warmup_steps:
+        training_manager.advance_schedule(step)
+        kd_step_active_warmup = bool(kd_cfg.enabled and kd_runtime_active and (step % kd_cfg.apply_every_steps == 0))
+        kd_micro_limit_warmup = (
+            grad_accum_steps
+            if kd_cfg.microbatches_per_step == 0
+            else min(kd_cfg.microbatches_per_step, grad_accum_steps)
+        )
+        model.eval()
+        with torch.no_grad():
+            inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+            model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+        model.train()
+        for idx in range(grad_accum_steps):
+            send_args = training_manager.train_loader_send_args
+            inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
+            if kd_cfg.enabled:
+                micro_kd_active = bool(kd_step_active_warmup and idx < kd_micro_limit_warmup)
+                if kd_cfg.teacher_bench_only:
+                    if micro_kd_active:
+                        _ = teacher_forward(
+                            inputs,
+                            None,
+                            cum_seqlens,
+                            bigram_inputs,
+                            training_manager.get_forward_args(),
+                            return_logits=True,
+                            return_loss=False,
+                        )
+                    continue
+                if kd_cfg.teacher_infer_only:
+                    hard_loss = model(
+                        inputs,
+                        targets,
+                        cum_seqlens,
+                        bigram_inputs,
+                        training_manager.get_forward_args(),
+                    )
+                    if micro_kd_active:
+                        _ = teacher_forward(
+                            inputs,
+                            None,
+                            cum_seqlens,
+                            bigram_inputs,
+                            training_manager.get_forward_args(),
+                            return_logits=True,
+                            return_loss=False,
+                        )
+                    warmup_loss = hard_loss
+                else:
+                    if micro_kd_active:
+                        logits, hard_loss = model(
+                            inputs,
+                            targets,
+                            cum_seqlens,
+                            bigram_inputs,
+                            training_manager.get_forward_args(),
+                            return_logits=True,
+                            return_loss=True,
+                        )
+                        if kd_cfg.random_teacher:
+                            teacher_logits = torch.randn_like(logits)
+                        else:
+                            teacher_logits = teacher_forward(
+                                inputs,
+                                None,
+                                cum_seqlens,
+                                bigram_inputs,
+                                training_manager.get_forward_args(),
+                                return_logits=True,
+                                return_loss=False,
+                            )
+                        soft_loss = compute_kd_soft_loss(
+                            logits,
+                            teacher_logits,
+                            kd_cfg.temperature,
+                            kd_cfg.soft_loss_token_chunk,
+                            kd_cfg.soft_loss_topk,
+                            kd_cfg.soft_loss_token_stride,
+                            kd_cfg.soft_loss_fp32,
+                            kd_cfg.soft_loss_log_target,
+                        )
+                        soft_loss = apply_kd_dynamic_norm(hard_loss, soft_loss)
+                        warmup_loss = hard_loss * kd_cfg.alpha
+                        warmup_loss = warmup_loss + soft_loss * (1.0 - kd_cfg.alpha)
+                    else:
+                        hard_loss = model(
+                            inputs,
+                            targets,
+                            cum_seqlens,
+                            bigram_inputs,
+                            training_manager.get_forward_args(),
+                        )
+                        warmup_loss = hard_loss
+                (warmup_loss / grad_accum_steps).backward()
+            else:
+                (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
+        if not kd_cfg.teacher_bench_only:
+            training_manager.step_optimizers(step)
+    print0("Resetting Model", console=True)
+    model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    training_manager.reset(initial_state["optimizer"])
+    del val_loader, train_loader, initial_state
     model.train()
-    for idx in range(grad_accum_steps):
-        send_args = training_manager.train_loader_send_args
-        inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(send_args)
-        if kd_cfg.enabled:
-            logits, hard_loss = model(
-                inputs,
-                targets,
-                cum_seqlens,
-                bigram_inputs,
-                training_manager.get_forward_args(),
-                return_logits=True,
-                return_loss=True,
-            )
-            with torch.no_grad():
-                teacher_logits = teacher_model(
-                    inputs,
-                    None,
-                    cum_seqlens,
-                    bigram_inputs,
-                    training_manager.get_forward_args(),
-                    return_logits=True,
-                    return_loss=False,
-                )
-            warmup_loss = kd_cfg.alpha * hard_loss + (1.0 - kd_cfg.alpha) * compute_kd_soft_loss(
-                logits, teacher_logits, kd_cfg.temperature
-            )
-            (warmup_loss / grad_accum_steps).backward()
-        else:
-            (model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()) / grad_accum_steps).backward()
-    training_manager.step_optimizers(step)
-print0("Resetting Model", console=True)
-model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-training_manager.reset(initial_state["optimizer"])
-del val_loader, train_loader, initial_state
-model.train()
 
 ########################################
 #        Training and validation       #
@@ -2176,6 +2862,10 @@ gc.collect()
 training_time_ms = 0
 kd_stop_step: int | None = None
 last_teacher_val_loss: float | None = None
+best_val_loss: float | None = None
+best_val_step: int | None = None
+early_stop_streak = 0
+early_stop_triggered_step: int | None = None
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -2185,7 +2875,7 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if (not kd_cfg.teacher_bench_only) and (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
         if last_step:
             training_manager.apply_final_ws_ext()
         # stop the clock
@@ -2196,31 +2886,71 @@ for step in range(train_steps + 1):
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
         val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
         val_loss = torch.zeros((), device=device, dtype=torch.float32)
-        teacher_val_loss = torch.zeros((), device=device, dtype=torch.float32) if kd_cfg.enabled else None
+        use_ref_teacher_val = (
+            kd_cfg.enabled
+            and kd_cfg.stop_mode == "val_margin"
+            and kd_cfg.stop_teacher_val_ref is not None
+        )
+        need_teacher_val = (
+            kd_cfg.enabled
+            and not kd_cfg.random_teacher
+            and kd_cfg.stop_mode == "val_margin"
+            and not use_ref_teacher_val
+        )
+        teacher_val_loss = torch.zeros((), device=device, dtype=torch.float32) if need_teacher_val else None
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
                 val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-                if kd_cfg.enabled:
-                    teacher_val_loss += teacher_model(
+                if need_teacher_val:
+                    teacher_val_loss += teacher_forward(
                         inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()
                     )
         val_loss /= val_steps
-        if kd_cfg.enabled:
+        if need_teacher_val:
             teacher_val_loss /= val_steps
         del val_loader
         dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
-        if kd_cfg.enabled:
+        if need_teacher_val:
             dist.reduce(teacher_val_loss, 0, op=dist.ReduceOp.AVG)
             last_teacher_val_loss = float(teacher_val_loss.item())
+        elif use_ref_teacher_val:
+            last_teacher_val_loss = float(kd_cfg.stop_teacher_val_ref)
+        current_val_loss = float(val_loss.item())
+        if master_process and save_best_checkpoint and (best_val_loss is None or current_val_loss < best_val_loss):
+            best_val_loss = current_val_loss
+            best_val_step = step
+            checkpoint_dir = os.environ.get("CKPT_DIR", f"logs/{run_id}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            best_log = dict(
+                step=step,
+                code=code,
+                model=model.state_dict(),
+                best_val_loss=best_val_loss,
+                kd_enabled=kd_cfg.enabled,
+                kd_stop_step=kd_stop_step,
+            )
+            torch.save(best_log, os.path.join(checkpoint_dir, "state_best.pt"))
+            print0(f"Saved best checkpoint at step:{step} val_loss:{best_val_loss:.4f}", console=True)
+        if need_teacher_val:
             if (
                 kd_runtime_active
-                and kd_cfg.stop_mode == "val_margin"
                 and step >= kd_cfg.stop_min_step
-                and float(val_loss.item()) <= last_teacher_val_loss + kd_cfg.stop_margin
+                and current_val_loss <= last_teacher_val_loss + kd_cfg.stop_margin
             ):
                 kd_runtime_active = False
                 kd_stop_step = step
+                kd_runtime_stop_step = step
+
+        early_stop_reached = False
+        if early_stop_target_val is not None and step >= early_stop_min_step:
+            if current_val_loss <= early_stop_target_val:
+                early_stop_streak += 1
+            else:
+                early_stop_streak = 0
+            if early_stop_streak >= early_stop_consecutive:
+                early_stop_reached = True
+                early_stop_triggered_step = step
 
         val_msg = (
             f"step:{step}/{train_steps} "
@@ -2229,12 +2959,36 @@ for step in range(train_steps + 1):
             f"step_avg:{training_time_ms/max(step, 1):.2f}ms"
         )
         if kd_cfg.enabled:
+            val_msg += f" kd_mode:{kd_mode}"
+        if kd_cfg.enabled and not kd_cfg.random_teacher:
+            teacher_val_str = f"{last_teacher_val_loss:.4f}" if last_teacher_val_loss is not None else "nan"
             val_msg += (
-                f" teacher_val_loss:{last_teacher_val_loss:.4f}"
+                f" teacher_val_loss:{teacher_val_str}"
                 f" kd_active:{kd_runtime_active}"
                 f" kd_stop_step:{kd_stop_step}"
             )
+        elif kd_cfg.enabled:
+            val_msg += (
+                f" teacher_val_loss:nan"
+                f" kd_active:{kd_runtime_active}"
+                f" kd_stop_step:{kd_stop_step}"
+            )
+        if early_stop_target_val is not None:
+            val_msg += (
+                f" early_stop_target_val:{early_stop_target_val:.4f}"
+                f" early_stop_streak:{early_stop_streak}"
+                f" early_stop_hit:{early_stop_reached}"
+            )
         print0(val_msg, console=True)
+
+        if early_stop_reached:
+            print0(
+                f"Early stop triggered at step:{step} "
+                f"(val_loss:{current_val_loss:.4f} <= target:{early_stop_target_val:.4f}, "
+                f"streak:{early_stop_streak}/{early_stop_consecutive})",
+                console=True,
+            )
+            break
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -2250,6 +3004,8 @@ for step in range(train_steps + 1):
                 optimizer=training_manager.get_state(),
                 kd_enabled=kd_cfg.enabled,
                 kd_stop_step=kd_stop_step,
+                best_val_loss=best_val_loss,
+                best_val_step=best_val_step,
             )
             os.makedirs(checkpoint_dir, exist_ok=True)
             torch.save(log, os.path.join(checkpoint_dir, f"state_step{step:06d}.pt"))
@@ -2260,67 +3016,239 @@ for step in range(train_steps + 1):
     train_total_loss = 0.0
     train_hard_loss = 0.0
     train_soft_loss = 0.0
-    alpha_step = kd_cfg.alpha if (kd_cfg.enabled and kd_runtime_active) else 1.0
+    kd_profile_enabled = bool(kd_cfg.profile_timing and torch.cuda.is_available())
+    kd_prof_student_ms = 0.0
+    kd_prof_teacher_ms = 0.0
+    kd_prof_soft_ms = 0.0
+    kd_prof_backward_ms = 0.0
+    kd_prof_step_profile_ms = 0.0
+    kd_prof_peak_alloc_mib = float("nan")
+    kd_prof_peak_reserved_mib = float("nan")
+    kd_prof_hard_dtype = "na"
+    kd_prof_soft_dtype = "na"
+    kd_prof_total_dtype = "na"
+    if kd_profile_enabled:
+        torch.cuda.reset_peak_memory_stats()
+    kd_micro_used = 0
+    kd_step_active = bool(kd_cfg.enabled and kd_runtime_active and (step % kd_cfg.apply_every_steps == 0))
+    kd_micro_limit = grad_accum_steps if kd_cfg.microbatches_per_step == 0 else min(kd_cfg.microbatches_per_step, grad_accum_steps)
+    alpha_step = 1.0 if (kd_cfg.enabled and kd_cfg.teacher_infer_only) else (kd_cfg.alpha if kd_step_active else 1.0)
     for idx in range(grad_accum_steps):
         inputs, targets, cum_seqlens, bigram_inputs = train_loader.send(training_manager.train_loader_send_args)
         if kd_cfg.enabled:
-            student_logits, hard_loss = model(
-                inputs,
-                targets,
-                cum_seqlens,
-                bigram_inputs,
-                training_manager.get_forward_args(),
-                return_logits=True,
-                return_loss=True,
-            )
-            if kd_runtime_active:
-                with torch.no_grad():
-                    teacher_logits = teacher_model(
+            micro_kd_active = bool(kd_step_active and idx < kd_micro_limit)
+            if kd_cfg.teacher_bench_only:
+                if micro_kd_active:
+                    _, dt_teacher = cuda_timed_call(
+                        kd_profile_enabled,
+                        lambda: teacher_forward(
+                            inputs,
+                            None,
+                            cum_seqlens,
+                            bigram_inputs,
+                            training_manager.get_forward_args(),
+                            return_logits=True,
+                            return_loss=False,
+                        ),
+                    )
+                    kd_prof_teacher_ms += dt_teacher
+                    kd_micro_used += 1
+                continue
+            if kd_cfg.teacher_infer_only:
+                hard_loss, dt_student = cuda_timed_call(
+                    kd_profile_enabled,
+                    lambda: model(
                         inputs,
-                        None,
+                        targets,
                         cum_seqlens,
                         bigram_inputs,
                         training_manager.get_forward_args(),
-                        return_logits=True,
-                        return_loss=False,
+                    ),
+                )
+                kd_prof_student_ms += dt_student
+                if micro_kd_active:
+                    _, dt_teacher = cuda_timed_call(
+                        kd_profile_enabled,
+                        lambda: teacher_forward(
+                            inputs,
+                            None,
+                            cum_seqlens,
+                            bigram_inputs,
+                            training_manager.get_forward_args(),
+                            return_logits=True,
+                            return_loss=False,
+                        ),
                     )
-                soft_loss = compute_kd_soft_loss(student_logits, teacher_logits, kd_cfg.temperature)
-            else:
+                    kd_prof_teacher_ms += dt_teacher
+                    kd_micro_used += 1
                 soft_loss = torch.zeros((), device=hard_loss.device, dtype=hard_loss.dtype)
-            total_loss = alpha_step * hard_loss + (1.0 - alpha_step) * soft_loss
-            (total_loss / grad_accum_steps).backward()
+                alpha_micro = 1.0
+            else:
+                if micro_kd_active:
+                    (student_logits, hard_loss), dt_student = cuda_timed_call(
+                        kd_profile_enabled,
+                        lambda: model(
+                            inputs,
+                            targets,
+                            cum_seqlens,
+                            bigram_inputs,
+                            training_manager.get_forward_args(),
+                            return_logits=True,
+                            return_loss=True,
+                        ),
+                    )
+                    kd_prof_student_ms += dt_student
+                    if kd_cfg.random_teacher:
+                        teacher_logits, dt_teacher = cuda_timed_call(
+                            kd_profile_enabled,
+                            lambda: torch.randn_like(student_logits),
+                        )
+                    else:
+                        teacher_logits, dt_teacher = cuda_timed_call(
+                            kd_profile_enabled,
+                            lambda: teacher_forward(
+                                inputs,
+                                None,
+                                cum_seqlens,
+                                bigram_inputs,
+                                training_manager.get_forward_args(),
+                                return_logits=True,
+                                return_loss=False,
+                            ),
+                        )
+                    kd_prof_teacher_ms += dt_teacher
+                    soft_loss, dt_soft = cuda_timed_call(
+                        kd_profile_enabled,
+                        lambda: compute_kd_soft_loss(
+                            student_logits,
+                            teacher_logits,
+                            kd_cfg.temperature,
+                            kd_cfg.soft_loss_token_chunk,
+                            kd_cfg.soft_loss_topk,
+                            kd_cfg.soft_loss_token_stride,
+                            kd_cfg.soft_loss_fp32,
+                            kd_cfg.soft_loss_log_target,
+                        ),
+                    )
+                    kd_prof_soft_ms += dt_soft
+                    soft_loss, dt_soft_norm = cuda_timed_call(
+                        kd_profile_enabled,
+                        lambda: apply_kd_dynamic_norm(hard_loss, soft_loss),
+                    )
+                    kd_prof_soft_ms += dt_soft_norm
+                    kd_micro_used += 1
+                    alpha_micro = kd_cfg.alpha
+                else:
+                    hard_loss, dt_student = cuda_timed_call(
+                        kd_profile_enabled,
+                        lambda: model(
+                            inputs,
+                            targets,
+                            cum_seqlens,
+                            bigram_inputs,
+                            training_manager.get_forward_args(),
+                        ),
+                    )
+                    kd_prof_student_ms += dt_student
+                    soft_loss = torch.zeros((), device=hard_loss.device, dtype=hard_loss.dtype)
+                    alpha_micro = 1.0
+            total_loss = hard_loss * alpha_micro
+            if alpha_micro < 1.0:
+                total_loss = total_loss + soft_loss * (1.0 - alpha_micro)
+            kd_prof_hard_dtype = str(hard_loss.dtype)
+            kd_prof_soft_dtype = str(soft_loss.dtype)
+            kd_prof_total_dtype = str(total_loss.dtype)
+            _, dt_backward = cuda_timed_call(
+                kd_profile_enabled,
+                lambda: (total_loss / grad_accum_steps).backward(),
+            )
+            kd_prof_backward_ms += dt_backward
             train_total_loss += float(total_loss.detach())
             train_hard_loss += float(hard_loss.detach())
             train_soft_loss += float(soft_loss.detach())
         else:
-            hard_loss = model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
-            (hard_loss / grad_accum_steps).backward()
+            hard_loss, dt_student = cuda_timed_call(
+                kd_profile_enabled,
+                lambda: model(
+                    inputs,
+                    targets,
+                    cum_seqlens,
+                    bigram_inputs,
+                    training_manager.get_forward_args(),
+                ),
+            )
+            kd_prof_student_ms += dt_student
+            _, dt_backward = cuda_timed_call(
+                kd_profile_enabled,
+                lambda: (hard_loss / grad_accum_steps).backward(),
+            )
+            kd_prof_hard_dtype = str(hard_loss.dtype)
+            kd_prof_soft_dtype = "na"
+            kd_prof_total_dtype = str(hard_loss.dtype)
+            kd_prof_backward_ms += dt_backward
             hard_val = float(hard_loss.detach())
             train_total_loss += hard_val
             train_hard_loss += hard_val
             train_soft_loss += 0.0
-    training_manager.step_optimizers(step)
+    if not kd_cfg.teacher_bench_only:
+        training_manager.step_optimizers(step)
 
     # logging
     inv_accum = 1.0 / grad_accum_steps
-    train_total_loss *= inv_accum
-    train_hard_loss *= inv_accum
-    train_soft_loss *= inv_accum
+    if kd_cfg.teacher_bench_only:
+        train_total_loss = float("nan")
+        train_hard_loss = float("nan")
+        train_soft_loss = float("nan")
+    else:
+        train_total_loss *= inv_accum
+        train_hard_loss *= inv_accum
+        train_soft_loss *= inv_accum
+    kd_micro_frac = (kd_micro_used / grad_accum_steps) if grad_accum_steps > 0 else 0.0
     current_lr_mult = get_kd_lr_multiplier(step)
+    post_kd_drop_active = kd_runtime_stop_step is not None and step >= kd_runtime_stop_step
+    if kd_profile_enabled:
+        kd_prof_step_profile_ms = (
+            kd_prof_student_ms
+            + kd_prof_teacher_ms
+            + kd_prof_soft_ms
+            + kd_prof_backward_ms
+        )
+        kd_prof_peak_alloc_mib = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        kd_prof_peak_reserved_mib = torch.cuda.max_memory_reserved() / (1024 * 1024)
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     train_msg = (
         f"step:{step+1}/{train_steps} "
         f"train_time:{approx_training_time_ms:.0f}ms "
         f"step_avg:{approx_training_time_ms/(step + 1):.2f}ms"
     )
+    train_msg += (
+        f" train_total_loss:{train_total_loss:.4f}"
+        f" train_hard_loss:{train_hard_loss:.4f}"
+    )
     if kd_cfg.enabled:
         train_msg += (
-            f" train_total_loss:{train_total_loss:.4f}"
-            f" train_hard_loss:{train_hard_loss:.4f}"
+            f" kd_mode:{kd_mode}"
+            f" kd_teacher_bench_only:{kd_cfg.teacher_bench_only}"
             f" train_soft_loss:{train_soft_loss:.4f}"
             f" distill_alpha:{alpha_step:.4f}"
             f" kd_active:{kd_runtime_active}"
+            f" kd_step_active:{kd_step_active}"
+            f" kd_micro_frac:{kd_micro_frac:.3f}"
             f" kd_lr_mult:{current_lr_mult:.4f}"
+            f" kd_post_drop_active:{post_kd_drop_active}"
+        )
+    if kd_profile_enabled:
+        train_msg += (
+            f" kd_prof_student_ms:{kd_prof_student_ms:.2f}"
+            f" kd_prof_teacher_ms:{kd_prof_teacher_ms:.2f}"
+            f" kd_prof_soft_ms:{kd_prof_soft_ms:.2f}"
+            f" kd_prof_backward_ms:{kd_prof_backward_ms:.2f}"
+            f" kd_prof_step_profile_ms:{kd_prof_step_profile_ms:.2f}"
+            f" kd_prof_peak_alloc_mib:{kd_prof_peak_alloc_mib:.1f}"
+            f" kd_prof_peak_reserved_mib:{kd_prof_peak_reserved_mib:.1f}"
+            f" kd_prof_hard_dtype:{kd_prof_hard_dtype}"
+            f" kd_prof_soft_dtype:{kd_prof_soft_dtype}"
+            f" kd_prof_total_dtype:{kd_prof_total_dtype}"
         )
     print0(train_msg, console=True)
 
